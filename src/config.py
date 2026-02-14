@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3:13b"
 
+    # Web Metadata Lookup
+    web_lookup_enabled: bool = True
+    web_lookup_timeout: int = 10  # seconds per API call
+
     # Logging
     log_level: str = "INFO"
 

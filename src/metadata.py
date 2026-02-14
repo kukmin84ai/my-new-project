@@ -27,6 +27,9 @@ class BookMetadata:
     title: str = ""
     author: str = ""
     isbn: str = ""
+    doi: str = ""
+    issn: str = ""
+    publisher: str = ""
     year: Optional[int] = None
     file_path: str = ""
     file_hash: str = ""
@@ -174,7 +177,7 @@ class MetadataStore:
         logger.info("MetadataStore initialized at %s", self.db_path)
 
     def _init_db(self) -> None:
-        """Create tables if not exist."""
+        """Create tables if not exist and run migrations."""
         cursor = self.conn.cursor()
         cursor.executescript(
             """
@@ -183,6 +186,9 @@ class MetadataStore:
                 title TEXT NOT NULL DEFAULT '',
                 author TEXT NOT NULL DEFAULT '',
                 isbn TEXT NOT NULL DEFAULT '',
+                doi TEXT NOT NULL DEFAULT '',
+                issn TEXT NOT NULL DEFAULT '',
+                publisher TEXT NOT NULL DEFAULT '',
                 year INTEGER,
                 file_path TEXT NOT NULL UNIQUE,
                 file_hash TEXT NOT NULL,
@@ -213,6 +219,14 @@ class MetadataStore:
                 ON processing_manifest(file_hash);
             """
         )
+        # Migrate existing databases: add new columns if missing
+        for col in ("doi", "issn", "publisher"):
+            try:
+                cursor.execute(
+                    f"ALTER TABLE books ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"
+                )
+            except sqlite3.OperationalError:
+                pass  # Column already exists
         self.conn.commit()
 
     def compute_file_hash(self, file_path: Path) -> str:
@@ -250,13 +264,17 @@ class MetadataStore:
         # Upsert book metadata
         cursor.execute(
             """
-            INSERT INTO books (title, author, isbn, year, file_path,
-                             file_hash, page_count, language, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO books (title, author, isbn, doi, issn, publisher,
+                             year, file_path, file_hash, page_count, language,
+                             created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(file_path) DO UPDATE SET
                 title = excluded.title,
                 author = excluded.author,
                 isbn = excluded.isbn,
+                doi = excluded.doi,
+                issn = excluded.issn,
+                publisher = excluded.publisher,
                 year = excluded.year,
                 file_hash = excluded.file_hash,
                 page_count = excluded.page_count,
@@ -267,6 +285,9 @@ class MetadataStore:
                 metadata.title,
                 metadata.author,
                 metadata.isbn,
+                metadata.doi,
+                metadata.issn,
+                metadata.publisher,
                 metadata.year,
                 str(file_path),
                 file_hash,
@@ -343,6 +364,9 @@ class MetadataStore:
                 title=row["title"],
                 author=row["author"],
                 isbn=row["isbn"],
+                doi=row["doi"],
+                issn=row["issn"],
+                publisher=row["publisher"],
                 year=row["year"],
                 file_path=row["file_path"],
                 file_hash=row["file_hash"],

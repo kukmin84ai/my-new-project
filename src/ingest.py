@@ -22,6 +22,7 @@ from src.processors import DocumentProcessor
 from src.database import VectorDatabase, EmbeddingEngine
 from src.chunking import ChunkingEngine
 from src.metadata import MetadataStore, BookMetadata
+from src.web_lookup import WebMetadataLookup
 from src.graph import KnowledgeGraph, extract_triplets_prompt, Triplet
 
 logger = logging.getLogger("bibliotheca.ingest")
@@ -139,6 +140,7 @@ def ingest_directory(
 
     # Initialize components (main process only — GPU + SQLite not fork-safe)
     meta_store = MetadataStore()
+    web_lookup = WebMetadataLookup(settings)
     chunker = ChunkingEngine(settings)
     embedder = EmbeddingEngine(settings)
     db = VectorDatabase(settings)
@@ -263,6 +265,20 @@ def ingest_directory(
             # Step 2a: Extract and register metadata
             first_text = ocr_result["documents"][0]["text"] if ocr_result["documents"] else ""
             book_meta = meta_store.extract_metadata_from_text(first_text, file_path_str)
+
+            # Step 2a-1: Web metadata enrichment
+            if web_lookup.enabled:
+                try:
+                    web_meta = web_lookup.lookup(book_meta)
+                    if web_meta and web_meta.confidence > 0.5:
+                        book_meta = web_lookup.merge_into(book_meta, web_meta)
+                        logger.info(
+                            "Enriched metadata from %s (confidence=%.2f)",
+                            web_meta.source_api, web_meta.confidence,
+                        )
+                except Exception:
+                    logger.debug("Web lookup failed for %s, continuing", file_path.name, exc_info=True)
+
             meta_store.register_file(file_path, book_meta)
 
             # Step 2b: Chunk all documents
@@ -309,8 +325,9 @@ def ingest_directory(
                         "chapter": chunk.chapter,
                         "section": chunk.section,
                         "language": chunk.metadata.get("language", ""),
-                        "book_title": chunk.metadata.get("book_title", ""),
-                        "author": chunk.metadata.get("author", ""),
+                        "ocr_confidence": chunk.metadata.get("ocr_confidence", 0.0),
+                        "book_title": chunk.metadata.get("book_title", "") or book_meta.title,
+                        "author": chunk.metadata.get("author", "") or book_meta.author,
                         "is_parent": chunk.is_parent,
                         "context_prefix": chunk.context_prefix,
                     }
