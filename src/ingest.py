@@ -1,11 +1,18 @@
 """Document ingestion pipeline for Bibliotheca AI.
 
 Orchestrates: file discovery -> dedup check -> OCR -> chunking -> embedding -> storage -> graph extraction
+
+Supports multicore parallelization:
+- Phase 1: Parallel OCR across worker processes (CPU-bound)
+- Phase 2: Serial embedding on GPU + LanceDB storage (GPU-bound)
 """
 import argparse
 import hashlib
 import logging
+import multiprocessing
+import os
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from tqdm import tqdm
@@ -20,6 +27,9 @@ from src.graph import KnowledgeGraph, extract_triplets_prompt, Triplet
 logger = logging.getLogger("bibliotheca.ingest")
 
 SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md", ".epub", ".png", ".jpg", ".jpeg"}
+
+# Max chunks to embed in a single call to avoid OOM on large documents
+MAX_EMBED_BATCH = 2048
 
 
 def discover_files(directory: Path) -> list[Path]:
@@ -44,19 +54,76 @@ def compute_file_hash(file_path: Path) -> str:
     return sha256.hexdigest()
 
 
+def _ocr_worker(file_path_str: str) -> dict:
+    """Worker function: OCR a single file in a separate process.
+
+    Returns serialized document dicts for IPC (avoids pickling complex objects).
+    Each worker creates its own DocumentProcessor to avoid shared state.
+    """
+    from src.config import get_settings
+    from src.processors import DocumentProcessor
+
+    settings = get_settings()
+    processor = DocumentProcessor(settings)
+    file_path = Path(file_path_str)
+
+    start = time.time()
+    try:
+        docs = processor.process_file(file_path)
+        elapsed = time.time() - start
+
+        # Serialize ProcessedDocument objects to plain dicts for IPC
+        serialized_docs = [
+            {
+                "text": d.text,
+                "source_file": d.source_file,
+                "page_num": d.page_num,
+                "language": d.language,
+                "ocr_confidence": d.ocr_confidence,
+                "ocr_tier_used": d.ocr_tier_used,
+                "processing_time": d.processing_time,
+                "metadata": d.metadata,
+            }
+            for d in docs
+        ]
+
+        return {
+            "file_path": file_path_str,
+            "status": "ok",
+            "documents": serialized_docs,
+            "elapsed": elapsed,
+            "error": None,
+        }
+    except Exception as e:
+        elapsed = time.time() - start
+        return {
+            "file_path": file_path_str,
+            "status": "error",
+            "documents": [],
+            "elapsed": elapsed,
+            "error": str(e),
+        }
+
+
 def ingest_directory(
     directory_path: str,
     force: bool = False,
     skip_graph: bool = False,
     batch_size: int = 32,
+    workers: int = 0,
 ) -> dict:
-    """Main ingestion pipeline with incremental processing.
+    """Main ingestion pipeline with multicore parallelization.
+
+    Architecture:
+    - Phase 1: Parallel OCR across worker processes (CPU-bound bottleneck)
+    - Phase 2: Serial embedding on GPU + LanceDB storage (GPU/IO-bound)
 
     Args:
         directory_path: Path to the directory containing documents.
         force: If True, reprocess all files regardless of prior state.
         skip_graph: If True, skip knowledge graph triplet extraction.
         batch_size: Number of chunks to embed in a single batch.
+        workers: Number of parallel OCR workers (0 = auto-detect).
 
     Returns:
         Summary dict with processed/skipped/error counts.
@@ -64,59 +131,150 @@ def ingest_directory(
     settings = get_settings()
     logger.info("Starting ingestion from: %s", directory_path)
 
-    # Initialize components
-    processor = DocumentProcessor(settings)
+    # Auto-detect worker count: leave 2 cores for main process + OS
+    if workers <= 0:
+        cpu_count = multiprocessing.cpu_count()
+        workers = max(1, min(cpu_count - 2, 8))
+    logger.info("Using %d OCR worker processes", workers)
+
+    # Initialize components (main process only — GPU + SQLite not fork-safe)
+    meta_store = MetadataStore()
     chunker = ChunkingEngine(settings)
     embedder = EmbeddingEngine(settings)
     db = VectorDatabase(settings)
-    meta_store = MetadataStore()
     graph = KnowledgeGraph()
 
     files = discover_files(Path(directory_path))
     logger.info("Found %d supported files", len(files))
 
-    processed_count = 0
+    # Filter already-processed files
+    files_to_process = []
     skipped_count = 0
-    error_count = 0
-    total_chunks = 0
-
-    for file_path in tqdm(files, desc="Processing documents"):
-        file_hash = compute_file_hash(file_path)
-
-        # Incremental: skip if already processed (by hash)
+    for file_path in files:
         if not force and meta_store.is_file_processed(file_path):
             skipped_count += 1
             logger.debug("Skipping (already processed): %s", file_path)
-            continue
+        else:
+            files_to_process.append(file_path)
 
+    logger.info(
+        "%d files to process, %d skipped (already done)",
+        len(files_to_process),
+        skipped_count,
+    )
+
+    if not files_to_process:
+        return {
+            "processed": 0,
+            "skipped": skipped_count,
+            "errors": 0,
+            "total_chunks": 0,
+            "total_files": len(files),
+        }
+
+    # Sort by file size (largest first) for better load balancing
+    files_to_process.sort(key=lambda p: p.stat().st_size, reverse=True)
+
+    processed_count = 0
+    error_count = 0
+    total_chunks = 0
+
+    # ── Phase 1: Parallel OCR ──────────────────────────────────────
+    logger.info("Phase 1: Parallel OCR with %d workers...", workers)
+    ocr_results: dict[str, dict] = {}
+
+    if workers == 1:
+        # Single-worker mode: run in main process (useful for debugging)
+        for file_path in tqdm(files_to_process, desc="OCR Processing"):
+            result = _ocr_worker(str(file_path))
+            if result["status"] == "ok" and result["documents"]:
+                ocr_results[str(file_path)] = result
+                logger.info(
+                    "OCR done: %s (%d pages, %.1fs)",
+                    file_path.name,
+                    len(result["documents"]),
+                    result["elapsed"],
+                )
+            else:
+                error_count += 1
+                meta_store.update_status(
+                    str(file_path), "error",
+                    error_message=result.get("error", "OCR produced no output"),
+                )
+                logger.error("OCR failed: %s — %s", file_path.name, result.get("error"))
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            future_to_file = {
+                executor.submit(_ocr_worker, str(fp)): fp
+                for fp in files_to_process
+            }
+
+            for future in tqdm(
+                as_completed(future_to_file),
+                total=len(future_to_file),
+                desc="OCR Processing",
+            ):
+                file_path = future_to_file[future]
+                try:
+                    result = future.result()
+                    if result["status"] == "ok" and result["documents"]:
+                        ocr_results[str(file_path)] = result
+                        logger.info(
+                            "OCR done: %s (%d pages, %.1fs)",
+                            file_path.name,
+                            len(result["documents"]),
+                            result["elapsed"],
+                        )
+                    else:
+                        error_count += 1
+                        meta_store.update_status(
+                            str(file_path), "error",
+                            error_message=result.get("error", "OCR produced no output"),
+                        )
+                        logger.error(
+                            "OCR failed: %s — %s",
+                            file_path.name,
+                            result.get("error"),
+                        )
+                except Exception:
+                    error_count += 1
+                    meta_store.update_status(str(file_path), "error")
+                    logger.exception("OCR worker crashed: %s", file_path)
+
+    logger.info(
+        "Phase 1 complete: %d files OCR'd, %d errors",
+        len(ocr_results),
+        error_count,
+    )
+
+    # ── Phase 2: Serial Embedding + Storage ────────────────────────
+    logger.info("Phase 2: Embedding + storage (GPU-accelerated)...")
+
+    for file_path_str, ocr_result in tqdm(
+        ocr_results.items(), desc="Embedding & Storage"
+    ):
+        file_path = Path(file_path_str)
         try:
+            # Clear MPS GPU cache between files to prevent memory fragmentation
+            _clear_gpu_cache()
+
             start_time = time.time()
 
-            # Step 1: OCR / text extraction
-            logger.info("Extracting text from: %s", file_path.name)
-            docs = processor.process_file(file_path)
-
-            if not docs:
-                logger.warning("No content extracted from: %s", file_path)
-                meta_store.update_status(str(file_path), "empty")
-                skipped_count += 1
-                continue
-
-            # Step 2: Extract and register metadata
-            first_text = docs[0].text if docs else ""
-            book_meta = meta_store.extract_metadata_from_text(first_text, str(file_path))
+            # Step 2a: Extract and register metadata
+            first_text = ocr_result["documents"][0]["text"] if ocr_result["documents"] else ""
+            book_meta = meta_store.extract_metadata_from_text(first_text, file_path_str)
             meta_store.register_file(file_path, book_meta)
 
-            # Step 3: Chunk all documents
+            # Step 2b: Chunk all documents
             all_chunks = []
-            for doc in docs:
+            for doc_dict in ocr_result["documents"]:
                 chunks = chunker.chunk_document(
-                    doc.text,
+                    doc_dict["text"],
                     {
-                        "source_file": str(file_path),
-                        "page_num": doc.page_num,
-                        "language": doc.language,
-                        "ocr_confidence": doc.ocr_confidence,
+                        "source_file": file_path_str,
+                        "page_num": doc_dict["page_num"],
+                        "language": doc_dict["language"],
+                        "ocr_confidence": doc_dict["ocr_confidence"],
                         "book_title": book_meta.title,
                         "author": book_meta.author,
                     },
@@ -125,16 +283,21 @@ def ingest_directory(
 
             if not all_chunks:
                 logger.warning("No chunks generated from: %s", file_path)
-                meta_store.update_status(str(file_path), "empty")
-                skipped_count += 1
+                meta_store.update_status(file_path_str, "empty")
                 continue
 
-            # Step 4: Embed and store in batches
+            # Step 2c: Embed in batches with OOM retry
             texts = [c.context_prefix + c.text for c in all_chunks]
-            embeddings = embedder.embed(texts)
+            all_embeddings = _embed_with_retry(embedder, texts, file_path.name)
 
+            # Step 2d: Store in LanceDB (filter out NaN vectors)
+            import math
             records = []
-            for chunk, embedding in zip(all_chunks, embeddings):
+            nan_count = 0
+            for chunk, embedding in zip(all_chunks, all_embeddings):
+                if any(math.isnan(v) for v in embedding):
+                    nan_count += 1
+                    continue
                 records.append(
                     {
                         "id": chunk.chunk_id,
@@ -152,20 +315,22 @@ def ingest_directory(
                         "context_prefix": chunk.context_prefix,
                     }
                 )
+            if nan_count:
+                logger.warning("Dropped %d chunks with NaN vectors from %s", nan_count, file_path.name)
 
             db.add_documents(records)
             total_chunks += len(records)
 
-            # Step 5: Knowledge graph extraction (optional)
+            # Step 2e: Knowledge graph extraction (optional)
             if not skip_graph:
-                _extract_graph_triplets(all_chunks, graph, str(file_path))
+                _extract_graph_triplets(all_chunks, graph, file_path_str)
 
             # Update processing status
             elapsed = time.time() - start_time
-            meta_store.update_status(str(file_path), "done")
+            meta_store.update_status(file_path_str, "done", chunk_count=len(all_chunks))
             processed_count += 1
             logger.info(
-                "Processed %s: %d chunks in %.1fs",
+                "Stored %s: %d chunks in %.1fs",
                 file_path.name,
                 len(all_chunks),
                 elapsed,
@@ -173,7 +338,7 @@ def ingest_directory(
 
         except Exception:
             error_count += 1
-            meta_store.update_status(str(file_path), "error")
+            meta_store.update_status(file_path_str, "error")
             logger.exception("Error processing %s", file_path)
 
     summary = {
@@ -193,6 +358,97 @@ def ingest_directory(
     return summary
 
 
+def _clear_gpu_cache() -> None:
+    """Clear MPS/CUDA GPU cache to prevent memory fragmentation between files."""
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+            torch.mps.synchronize()
+            logger.debug("MPS cache cleared")
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.debug("CUDA cache cleared")
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+
+
+def _embed_with_retry(
+    embedder: "EmbeddingEngine",
+    texts: list[str],
+    file_name: str,
+    initial_batch_size: int = MAX_EMBED_BATCH,
+) -> list[list[float]]:
+    """Embed texts with automatic batch size reduction on OOM.
+
+    If MPS OOM occurs, clears cache, halves the batch size, and retries.
+    Falls back to CPU as last resort.
+    """
+    batch_size = initial_batch_size
+    all_embeddings: list[list[float]] = []
+
+    while batch_size >= 64:
+        all_embeddings = []
+        try:
+            for batch_start in range(0, len(texts), batch_size):
+                batch_end = min(batch_start + batch_size, len(texts))
+                batch_texts = texts[batch_start:batch_end]
+                logger.info(
+                    "Embedding batch %d-%d/%d for %s (batch_size=%d)",
+                    batch_start + 1,
+                    batch_end,
+                    len(texts),
+                    file_name,
+                    batch_size,
+                )
+                batch_embeddings = embedder.embed(batch_texts)
+                all_embeddings.extend(batch_embeddings)
+            return all_embeddings
+        except RuntimeError as e:
+            if "out of memory" in str(e) or "Invalid buffer size" in str(e):
+                logger.warning(
+                    "OOM with batch_size=%d for %s, halving and retrying...",
+                    batch_size,
+                    file_name,
+                )
+                _clear_gpu_cache()
+                batch_size //= 2
+            else:
+                raise
+
+    # Final fallback: CPU embedding with small batches
+    logger.warning("Falling back to CPU embedding for %s", file_name)
+    _clear_gpu_cache()
+
+    original_device = embedder.model.device
+    embedder.model.to("cpu")
+    original_batch_size = embedder.batch_size
+    embedder.batch_size = 8
+
+    try:
+        all_embeddings = []
+        for batch_start in range(0, len(texts), 256):
+            batch_end = min(batch_start + 256, len(texts))
+            batch_texts = texts[batch_start:batch_end]
+            logger.info(
+                "CPU embedding %d-%d/%d for %s",
+                batch_start + 1,
+                batch_end,
+                len(texts),
+                file_name,
+            )
+            batch_embeddings = embedder.embed(batch_texts)
+            all_embeddings.extend(batch_embeddings)
+        return all_embeddings
+    finally:
+        # Restore GPU device
+        embedder.model.to(str(original_device))
+        embedder.batch_size = original_batch_size
+        _clear_gpu_cache()
+
+
 def _extract_graph_triplets(
     chunks: list,
     graph: KnowledgeGraph,
@@ -207,10 +463,6 @@ def _extract_graph_triplets(
     """
     for chunk in chunks[:max_chunks]:
         prompt = extract_triplets_prompt(chunk.text, max_triplets=12)
-        # In production: send prompt to Ollama and parse response
-        # response = call_ollama(prompt)
-        # triplets = parse_triplets_response(response, source_file, chunk.chunk_id)
-        # graph.add_triplets(triplets)
         logger.debug(
             "Graph extraction prompt generated for chunk %s (%d chars)",
             getattr(chunk, "chunk_id", "unknown"),
@@ -251,10 +503,14 @@ def ingest_single_file(
         str(parent),
         force=force,
         skip_graph=skip_graph,
+        workers=1,
     )
 
 
 if __name__ == "__main__":
+    # Use spawn method for macOS compatibility (fork can cause issues with GPU)
+    multiprocessing.set_start_method("spawn", force=True)
+
     parser = argparse.ArgumentParser(
         description="Ingest documents into Bibliotheca AI"
     )
@@ -278,6 +534,12 @@ if __name__ == "__main__":
         help="Skip knowledge graph extraction",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Number of parallel OCR workers (0 = auto-detect, default: 0)",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -288,11 +550,12 @@ if __name__ == "__main__":
     setup_logging(args.log_level)
 
     if args.device != "auto":
-        import os
-
         os.environ["BIBLIO_GPU_DEVICE"] = args.device
 
     result = ingest_directory(
-        args.dir, force=args.force, skip_graph=args.skip_graph
+        args.dir,
+        force=args.force,
+        skip_graph=args.skip_graph,
+        workers=args.workers,
     )
     logger.info("Final summary: %s", result)

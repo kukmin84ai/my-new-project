@@ -62,7 +62,7 @@ DOCUMENT_SCHEMA = pa.schema(
     [
         pa.field("id", pa.string()),
         pa.field("text", pa.string()),
-        pa.field("vector", pa.list_(pa.float32())),
+        pa.field("vector", pa.list_(pa.float32(), 1024)),
         pa.field("parent_id", pa.string()),
         pa.field("source_file", pa.string()),
         pa.field("page_num", pa.int32()),
