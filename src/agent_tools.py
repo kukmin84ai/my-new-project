@@ -418,7 +418,7 @@ def search_by_metadata(
             "title": getattr(book, "title", ""),
             "author": getattr(book, "author", ""),
             "year": getattr(book, "year", None),
-            "source_file": getattr(book, "source_file", ""),
+            "source_file": getattr(book, "file_path", ""),
             "language": getattr(book, "language", ""),
         })
 
@@ -433,7 +433,7 @@ def list_all_books() -> list[dict]:
         {
             "title": getattr(b, "title", ""),
             "author": getattr(b, "author", ""),
-            "source_file": getattr(b, "source_file", ""),
+            "source_file": getattr(b, "file_path", ""),
         }
         for b in all_books
     ]

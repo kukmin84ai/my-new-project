@@ -34,6 +34,134 @@ class BookMetadata:
     language: str = ""
 
 
+# Regex patterns for common libgen filename formats
+_FILENAME_PATTERNS = [
+    # [Series] Author - Title (Year, Publisher) - libgen.li.pdf
+    re.compile(
+        r"^\[(?P<series>[^\]]+)\]\s+"
+        r"(?P<author>.+?)\s+-\s+"
+        r"(?P<title>.+?)\s+"
+        r"\((?P<year>\d{4}),\s*(?P<publisher>[^)]+)\)"
+    ),
+    # Author - Title (Extra) __ (Year, Publisher) [DOI] - libgen.li.pdf
+    re.compile(
+        r"^(?P<author>[^-]+?)\s+-\s+"
+        r"(?P<title>.+?)\s+"
+        r"(?:\([^)]*\)\s+)?__\s+"
+        r"\((?P<year>\d{4}),\s*(?P<publisher>[^)]+)\)"
+    ),
+    # Author - Title (Year, Publisher) - libgen.li.pdf
+    re.compile(
+        r"^(?P<author>.+?)\s+-\s+"
+        r"(?P<title>.+?)\s+"
+        r"\((?P<year>\d{4}),\s*(?P<publisher>[^)]+)\)"
+    ),
+    # Author - Title (Year) - libgen.li.pdf
+    re.compile(
+        r"^(?P<author>.+?)\s+-\s+"
+        r"(?P<title>.+?)\s+"
+        r"\((?P<year>\d{4})\)"
+    ),
+    # [Series] Author(s) - Title (Year, Publisher  (possibly truncated filename)
+    re.compile(
+        r"^\[(?P<series>[^\]]+)\]\s+"
+        r"(?P<author>.+?)\s+-\s+"
+        r"(?P<title>.+?)\s+"
+        r"\((?P<year>\d{4}),\s*(?P<publisher>[^)]*?)$"
+    ),
+    # Author (author)_Author2 (desc) - Title  (role markers in author part)
+    re.compile(
+        r"^(?P<author_raw>(?:[^_]+\([^)]*\)_?)+)\s*-\s+"
+        r"(?P<title>.+)$",
+    ),
+]
+
+# Pattern for filenames with explicit (author) role markers
+_AUTHOR_MARKER_RE = re.compile(r"\(author\)", re.IGNORECASE)
+
+
+def _clean_author_from_raw(raw: str) -> str:
+    """Clean author string from filename patterns like 'Name (role)_Name2 (role)'."""
+    # Split on _ separator for multi-author entries
+    parts = re.split(r"_", raw)
+    authors = []
+    for part in parts:
+        # Remove parenthetical role descriptions like (author), (auth.)
+        name = re.sub(r"\s*\([^)]*\)\s*", " ", part).strip()
+        if name:
+            authors.append(name)
+    return ", ".join(authors)
+
+
+def extract_metadata_from_filename(filename: str) -> BookMetadata:
+    """Parse structured metadata from a PDF filename.
+
+    Handles common libgen filename conventions. Returns a BookMetadata
+    with whatever fields could be extracted (empty string for missing fields).
+    """
+    # Strip path, extension, and common suffixes
+    stem = Path(filename).stem
+    stem = re.sub(r"\s*-\s*libgen\.\w+$", "", stem)
+    stem = re.sub(r"\s*\[[\d./]+\]$", "", stem)  # trailing DOI brackets
+
+    # Special handling for filenames with explicit (author) role markers
+    # but without series brackets (which are handled by _FILENAME_PATTERNS)
+    if _AUTHOR_MARKER_RE.search(stem) and not stem.startswith("["):
+        # Split on _ to get parts; extract author names from (author) parts
+        parts = stem.split("_")
+        authors = []
+        for part in parts:
+            if _AUTHOR_MARKER_RE.search(part):
+                name = re.sub(r"\s*\(author\)\s*", "", part, flags=re.IGNORECASE).strip()
+                if name:
+                    authors.append(name)
+            else:
+                # Non-author part may contain "Name (role desc) - Title"
+                # Extract the name before the first parenthetical
+                name_match = re.match(r"([^(]+)", part)
+                if name_match:
+                    name = name_match.group(1).strip().rstrip(",")
+                    if name:
+                        authors.append(name)
+        # Title is after the last " - " in the full stem
+        title_split = re.split(r"\s+-\s+", stem)
+        title = title_split[-1].strip() if len(title_split) > 1 else ""
+        if authors and title:
+            return BookMetadata(title=title, author=", ".join(authors))
+
+    for pattern in _FILENAME_PATTERNS:
+        m = pattern.search(stem)
+        if not m:
+            continue
+
+        groups = m.groupdict()
+
+        # Handle author_raw (multi-author with roles) vs plain author
+        if "author_raw" in groups:
+            author = _clean_author_from_raw(groups["author_raw"])
+        else:
+            author = _clean_author_from_raw(groups.get("author", ""))
+
+        title = groups.get("title", "").strip().rstrip("_").strip()
+        year_str = groups.get("year", "")
+        year = int(year_str) if year_str else None
+
+        return BookMetadata(title=title, author=author, year=year)
+
+    # No pattern matched — opaque filename
+    return BookMetadata()
+
+
+def _clean_text_metadata(value: str) -> str:
+    """Strip markdown/HTML artifacts from OCR-extracted metadata."""
+    # Remove markdown headers and HTML comments
+    value = re.sub(r"^#{1,6}\s+", "", value)
+    value = re.sub(r"<!--.*?-->", "", value)
+    # Truncate at first newline
+    value = value.split("\n")[0].strip()
+    return value
+
+
 class MetadataStore:
     """SQLite-based metadata and processing manifest."""
 
@@ -250,40 +378,57 @@ class MetadataStore:
     ) -> BookMetadata:
         """Extract title, author, ISBN, year from first pages of text.
 
-        Uses regex heuristics on the first ~2000 characters.
+        Prefers filename-based extraction. Falls back to regex heuristics
+        on the first ~2000 characters for any missing fields.
         """
+        # Try filename first — it's the cleanest source
+        filename_meta = extract_metadata_from_filename(file_path)
+
         sample = text[:2000]
         metadata = BookMetadata(file_path=file_path)
 
-        # Title: first non-empty line or first markdown header
-        title_match = re.search(r"^#\s+(.+)$", sample, re.MULTILINE)
-        if title_match:
-            metadata.title = title_match.group(1).strip()
+        # Title: prefer filename, fall back to OCR
+        if filename_meta.title:
+            metadata.title = filename_meta.title
         else:
-            lines = [l.strip() for l in sample.split("\n") if l.strip()]
-            if lines:
-                metadata.title = lines[0][:200]
+            title_match = re.search(r"^#\s+(.+)$", sample, re.MULTILINE)
+            if title_match:
+                metadata.title = _clean_text_metadata(title_match.group(1))
+            else:
+                lines = [l.strip() for l in sample.split("\n") if l.strip()]
+                if lines:
+                    metadata.title = _clean_text_metadata(lines[0][:200])
 
-        # Author: look for "by Author" or "Author:" patterns
-        author_match = re.search(
-            r"(?:by|author[:\s])\s*([A-Z][a-zA-Z\s,.\-']+)",
-            sample,
-            re.IGNORECASE,
-        )
-        if author_match:
-            metadata.author = author_match.group(1).strip().rstrip(",.")
+        # Author: prefer filename, fall back to OCR (with cleaning)
+        if filename_meta.author:
+            metadata.author = filename_meta.author
+        else:
+            author_match = re.search(
+                r"(?:by|author[:\s])\s*([A-Z][a-zA-Z\s,.\-']+)",
+                sample,
+                re.IGNORECASE,
+            )
+            if author_match:
+                author = author_match.group(1).strip().rstrip(",.")
+                author = _clean_text_metadata(author)
+                # Reject paragraph-length values — not real author names
+                if len(author) <= 80:
+                    metadata.author = author
 
-        # ISBN: standard ISBN-10 or ISBN-13
+        # Year: prefer filename, fall back to OCR
+        if filename_meta.year:
+            metadata.year = filename_meta.year
+        else:
+            year_match = re.search(r"\b(19|20)\d{2}\b", sample)
+            if year_match:
+                metadata.year = int(year_match.group(0))
+
+        # ISBN: only from OCR text
         isbn_match = re.search(
             r"ISBN[:\s-]*([\d\-]{10,17})", sample, re.IGNORECASE
         )
         if isbn_match:
             metadata.isbn = isbn_match.group(1).replace("-", "")
-
-        # Year: 4-digit year between 1900 and 2099
-        year_match = re.search(r"\b(19|20)\d{2}\b", sample)
-        if year_match:
-            metadata.year = int(year_match.group(0))
 
         return metadata
 
