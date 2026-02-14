@@ -19,7 +19,8 @@ from tqdm import tqdm
 
 from src.config import get_settings, setup_logging
 from src.processors import DocumentProcessor
-from src.database import VectorDatabase, EmbeddingEngine
+from src.database import VectorDatabase
+from src.embedding_providers import create_embedder
 from src.chunking import ChunkingEngine
 from src.metadata import MetadataStore, BookMetadata
 from src.web_lookup import WebMetadataLookup
@@ -108,6 +109,7 @@ def _ocr_worker(file_path_str: str) -> dict:
 
 def ingest_directory(
     directory_path: str,
+    subject: str = "default",
     force: bool = False,
     skip_graph: bool = False,
     batch_size: int = 32,
@@ -121,6 +123,7 @@ def ingest_directory(
 
     Args:
         directory_path: Path to the directory containing documents.
+        subject: Subject category for domain separation (e.g., "emc", "physics").
         force: If True, reprocess all files regardless of prior state.
         skip_graph: If True, skip knowledge graph triplet extraction.
         batch_size: Number of chunks to embed in a single batch.
@@ -142,9 +145,9 @@ def ingest_directory(
     meta_store = MetadataStore()
     web_lookup = WebMetadataLookup(settings)
     chunker = ChunkingEngine(settings)
-    embedder = EmbeddingEngine(settings)
-    db = VectorDatabase(settings)
-    graph = KnowledgeGraph()
+    embedder = create_embedder(settings)
+    db = VectorDatabase(settings, subject=subject, vector_dim=embedder.dimension)
+    graph = KnowledgeGraph(subject=subject)
 
     files = discover_files(Path(directory_path))
     logger.info("Found %d supported files", len(files))
@@ -279,6 +282,7 @@ def ingest_directory(
                 except Exception:
                     logger.debug("Web lookup failed for %s, continuing", file_path.name, exc_info=True)
 
+            book_meta.subject = subject
             meta_store.register_file(file_path, book_meta)
 
             # Step 2b: Chunk all documents
@@ -330,6 +334,8 @@ def ingest_directory(
                         "author": chunk.metadata.get("author", "") or book_meta.author,
                         "is_parent": chunk.is_parent,
                         "context_prefix": chunk.context_prefix,
+                        "subject": subject,
+                        "embedding_model": settings.embedding_model,
                     }
                 )
             if nan_count:
@@ -393,7 +399,7 @@ def _clear_gpu_cache() -> None:
 
 
 def _embed_with_retry(
-    embedder: "EmbeddingEngine",
+    embedder,
     texts: list[str],
     file_name: str,
     initial_batch_size: int = MAX_EMBED_BATCH,
@@ -435,9 +441,14 @@ def _embed_with_retry(
             else:
                 raise
 
-    # Final fallback: CPU embedding with small batches
+    # Final fallback: CPU embedding with small batches (only for LocalEmbedder)
     logger.warning("Falling back to CPU embedding for %s", file_name)
     _clear_gpu_cache()
+
+    from src.embedding_providers import LocalEmbedder
+    if not isinstance(embedder, LocalEmbedder):
+        # API-based embedders don't have GPU fallback — re-raise
+        raise RuntimeError(f"Embedding failed for {file_name} after batch reduction")
 
     original_device = embedder.model.device
     embedder.model.to("cpu")
@@ -489,6 +500,7 @@ def _extract_graph_triplets(
 
 def ingest_single_file(
     file_path: str,
+    subject: str = "default",
     force: bool = False,
     skip_graph: bool = False,
 ) -> dict:
@@ -499,6 +511,7 @@ def ingest_single_file(
 
     Args:
         file_path: Path to the file to ingest.
+        subject: Subject category for domain separation.
         force: If True, reprocess even if already ingested.
         skip_graph: If True, skip graph triplet extraction.
 
@@ -518,6 +531,7 @@ def ingest_single_file(
     parent = path.parent
     return ingest_directory(
         str(parent),
+        subject=subject,
         force=force,
         skip_graph=skip_graph,
         workers=1,
@@ -539,6 +553,12 @@ if __name__ == "__main__":
         type=str,
         default="auto",
         help="GPU device: auto/cuda/mps/cpu",
+    )
+    parser.add_argument(
+        "--subject",
+        type=str,
+        default="default",
+        help="Subject category (e.g., emc, physics, medical)",
     )
     parser.add_argument(
         "--force",
@@ -571,6 +591,7 @@ if __name__ == "__main__":
 
     result = ingest_directory(
         args.dir,
+        subject=args.subject,
         force=args.force,
         skip_graph=args.skip_graph,
         workers=args.workers,

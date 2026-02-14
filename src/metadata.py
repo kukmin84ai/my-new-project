@@ -35,6 +35,8 @@ class BookMetadata:
     file_hash: str = ""
     page_count: int = 0
     language: str = ""
+    subject: str = ""   # "emc", "physics", "medical" etc.
+    tags: str = ""      # comma-separated detail tags
 
 
 # Regex patterns for common libgen filename formats
@@ -227,6 +229,13 @@ class MetadataStore:
                 )
             except sqlite3.OperationalError:
                 pass  # Column already exists
+        for col in ("subject", "tags"):
+            try:
+                cursor.execute(
+                    f"ALTER TABLE books ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"
+                )
+            except sqlite3.OperationalError:
+                pass  # Column already exists
         self.conn.commit()
 
     def compute_file_hash(self, file_path: Path) -> str:
@@ -266,8 +275,9 @@ class MetadataStore:
             """
             INSERT INTO books (title, author, isbn, doi, issn, publisher,
                              year, file_path, file_hash, page_count, language,
+                             subject, tags,
                              created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(file_path) DO UPDATE SET
                 title = excluded.title,
                 author = excluded.author,
@@ -279,6 +289,8 @@ class MetadataStore:
                 file_hash = excluded.file_hash,
                 page_count = excluded.page_count,
                 language = excluded.language,
+                subject = excluded.subject,
+                tags = excluded.tags,
                 updated_at = excluded.updated_at
             """,
             (
@@ -293,6 +305,8 @@ class MetadataStore:
                 file_hash,
                 metadata.page_count,
                 metadata.language,
+                metadata.subject,
+                metadata.tags,
                 now,
                 now,
             ),
@@ -372,6 +386,35 @@ class MetadataStore:
                 file_hash=row["file_hash"],
                 page_count=row["page_count"],
                 language=row["language"],
+                subject=row["subject"],
+                tags=row["tags"],
+            )
+            for row in rows
+        ]
+
+    def get_books_by_subject(self, subject: str) -> list[BookMetadata]:
+        """Retrieve books filtered by subject domain."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT * FROM books WHERE subject = ? ORDER BY created_at DESC",
+            (subject,),
+        )
+        rows = cursor.fetchall()
+        return [
+            BookMetadata(
+                title=row["title"],
+                author=row["author"],
+                isbn=row["isbn"],
+                doi=row["doi"],
+                issn=row["issn"],
+                publisher=row["publisher"],
+                year=row["year"],
+                file_path=row["file_path"],
+                file_hash=row["file_hash"],
+                page_count=row["page_count"],
+                language=row["language"],
+                subject=row["subject"],
+                tags=row["tags"],
             )
             for row in rows
         ]

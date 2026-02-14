@@ -15,6 +15,13 @@ class GPUDevice(str, Enum):
     CPU = "cpu"
 
 
+class EmbeddingProvider(str, Enum):
+    LOCAL = "local"
+    OPENAI = "openai"
+    VOYAGE = "voyage"
+    JINA = "jina"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="BIBLIO_", extra="ignore"
@@ -36,6 +43,8 @@ class Settings(BaseSettings):
     # Embedding
     embedding_model: str = "BAAI/bge-m3"
     embedding_batch_size: int = 32
+    embedding_provider: EmbeddingProvider = EmbeddingProvider.LOCAL
+    embedding_api_key: Optional[str] = None
 
     # Database Paths
     data_dir: Path = Path("data")
@@ -43,6 +52,9 @@ class Settings(BaseSettings):
     sqlite_db_path: Path = Path("./bibliotheca_meta.db")
     ocr_cache_dir: Path = Path("./ocr_cache")
     graph_store_dir: Path = Path("./graph_store")
+
+    # Subject (knowledge domain)
+    default_subject: str = "default"
 
     # GPU
     gpu_device: GPUDevice = GPUDevice.AUTO

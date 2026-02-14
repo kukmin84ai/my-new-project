@@ -21,7 +21,9 @@ from src.agent_tools import (
     search_by_metadata,
     list_all_books,
     graph_stats,
+    QueryEngine,
 )
+from src.database import VectorDatabase
 
 logger = logging.getLogger("bibliotheca.mcp")
 
@@ -34,17 +36,18 @@ def _fmt_json(data) -> str:
 
 
 @mcp.tool()
-def search_books(query: str, top_k: int = 5) -> str:
-    """Search the EMC engineering book library semantically.
+def search_books(query: str, top_k: int = 5, subject: str = "default") -> str:
+    """Search the scholarly book library semantically within a subject domain.
 
     Args:
         query: Natural language search query (e.g. "electromagnetic shielding techniques")
         top_k: Number of results to return (default 5)
+        subject: Subject domain to search (e.g. "emc", "physics"). Use "default" for legacy data.
 
     Returns:
         Formatted search results with text excerpts and source attribution.
     """
-    results = search_vector(query, top_k=top_k)
+    results = search_vector(query, top_k=top_k, subject=subject)
     if not results:
         return "No results found."
 
@@ -179,6 +182,97 @@ def get_graph_stats() -> str:
         Statistics about entities and relationships in the knowledge graph.
     """
     return _fmt_json(graph_stats())
+
+
+@mcp.tool()
+def list_subjects() -> str:
+    """List all registered subject domains in the knowledge base.
+
+    Returns:
+        List of subject names (e.g. ["default", "emc", "physics"]).
+    """
+    subjects = VectorDatabase.list_subject_tables()
+    if not subjects:
+        return "No subjects found. Ingest documents with --subject to create domains."
+    return _fmt_json(subjects)
+
+
+@mcp.tool()
+def search_subject(query: str, subject: str, top_k: int = 5) -> str:
+    """Search within a specific subject domain.
+
+    Args:
+        query: Natural language search query
+        subject: Subject domain to search (e.g. "emc", "physics", "medical")
+        top_k: Number of results to return (default 5)
+
+    Returns:
+        Formatted search results from the specified subject domain.
+    """
+    results = search_vector(query, top_k=top_k, subject=subject)
+    if not results:
+        return f"No results found in subject '{subject}'."
+
+    parts = []
+    for i, r in enumerate(results, 1):
+        source = r.get("book_title") or r.get("source_file", "Unknown")
+        chapter = r.get("chapter", "")
+        section = r.get("section", "")
+        page = r.get("page_num")
+        score = r.get("score", 0)
+
+        location = f" [{subject}]"
+        if chapter:
+            location += f" > {chapter}"
+        if section:
+            location += f" > {section}"
+        if page:
+            location += f" (p.{page})"
+
+        parts.append(
+            f"### Result {i} [score: {score:.3f}]\n"
+            f"**Source**: {source}{location}\n\n"
+            f"{r.get('text', '')}\n"
+        )
+
+    return "\n---\n".join(parts)
+
+
+@mcp.tool()
+def search_all(query: str, top_k: int = 5) -> str:
+    """Search across ALL subject domains simultaneously.
+
+    Args:
+        query: Natural language search query
+        top_k: Number of results to return (default 5)
+
+    Returns:
+        Merged results from all subject domains, ranked by relevance.
+    """
+    engine = QueryEngine()
+    response = engine.query_all_subjects(query, top_k=top_k)
+
+    if not response.sources:
+        return "No results found across any subject domain."
+
+    parts = []
+    for i, sr in enumerate(response.sources, 1):
+        source = sr.book_title or sr.source_file or "Unknown"
+        location = ""
+        if sr.chapter:
+            location += f" > {sr.chapter}"
+        if sr.section:
+            location += f" > {sr.section}"
+        if sr.page_num:
+            location += f" (p.{sr.page_num})"
+
+        parts.append(
+            f"### Result {i} [score: {sr.score:.3f}]\n"
+            f"**Source**: {source}{location}\n\n"
+            f"{sr.text}\n"
+        )
+
+    return "\n---\n".join(parts)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,8 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 
 from src.config import get_settings
-from src.database import VectorDatabase, EmbeddingEngine
+from src.database import VectorDatabase
+from src.embedding_providers import create_embedder
 from src.graph import KnowledgeGraph
 from src.metadata import MetadataStore
 
@@ -54,13 +55,14 @@ class QueryResponse:
 class QueryEngine:
     """Hybrid search query engine with agentic RAG capabilities."""
 
-    def __init__(self) -> None:
+    def __init__(self, subject: str = "default") -> None:
+        self.subject = subject
         self.settings = get_settings()
-        self.db = VectorDatabase()
-        self.embedder = EmbeddingEngine()
-        self.graph = KnowledgeGraph()
+        self.embedder = create_embedder(self.settings)
+        self.db = VectorDatabase(subject=subject, vector_dim=self.embedder.dimension)
+        self.graph = KnowledgeGraph(subject=subject)
         self.metadata_store = MetadataStore()
-        logger.info("QueryEngine initialized")
+        logger.info("QueryEngine initialized (subject=%s)", subject)
 
     def query(self, query_text: str, top_k: int = 10, filters: Optional[dict] = None) -> QueryResponse:
         """Main query entry point with hybrid search."""
@@ -235,20 +237,57 @@ class QueryEngine:
 
         return merged
 
+    def query_all_subjects(
+        self, query_text: str, top_k: int = 10, filters: Optional[dict] = None
+    ) -> QueryResponse:
+        """Search across all registered subject tables and merge results."""
+        subjects = VectorDatabase.list_subject_tables(self.settings)
+        if not subjects:
+            subjects = ["default"]
+
+        query_embedding = self.embedder.embed_query(query_text)
+        all_results: list[SearchResult] = []
+
+        for subj in subjects:
+            db = VectorDatabase(self.settings, subject=subj, vector_dim=self.embedder.dimension)
+            try:
+                raw_results = db.hybrid_search(
+                    query_text, query_embedding, top_k=top_k, filters=filters,
+                )
+                for r in raw_results:
+                    sr = self._to_search_result(r)
+                    all_results.append(sr)
+            except Exception:
+                logger.debug("Skipping subject %s (no data or error)", subj, exc_info=True)
+
+        # Sort by score descending and truncate
+        all_results.sort(key=lambda r: r.score, reverse=True)
+
+        return QueryResponse(
+            answer="",
+            sources=all_results[:top_k],
+            query_type="cross_subject_search",
+        )
+
 
 # -----------------------------------------------------------------
 # Agentic RAG Tool Functions
 # Standalone functions for use in tool-calling agents
 # -----------------------------------------------------------------
 
-def search_vector(query: str, filters: Optional[dict] = None, top_k: int = 10) -> list[dict]:
+def search_vector(
+    query: str,
+    filters: Optional[dict] = None,
+    top_k: int = 10,
+    subject: str = "default",
+) -> list[dict]:
     """Semantic search + metadata filter.
 
     Returns a list of dicts with text, score, source_file, book_title, etc.
     """
     settings = get_settings()
-    embedder = EmbeddingEngine(settings)
-    db = VectorDatabase(settings)
+    embedder = create_embedder(settings)
+    db = VectorDatabase(settings, subject=subject, vector_dim=embedder.dimension)
 
     embedding = embedder.embed_query(query)
     results = db.search(embedding, top_k=top_k, filters=filters)
@@ -267,12 +306,12 @@ def search_vector(query: str, filters: Optional[dict] = None, top_k: int = 10) -
     ]
 
 
-def search_graph(entity: str, relationship_type: Optional[str] = None) -> dict:
+def search_graph(entity: str, relationship_type: Optional[str] = None, subject: str = "default") -> dict:
     """Knowledge graph traversal.
 
     Looks up an entity by name and returns its properties and relationships.
     """
-    graph = KnowledgeGraph()
+    graph = KnowledgeGraph(subject=subject)
     entity_obj = graph.search_entity(entity)
     if not entity_obj:
         return {"error": f"Entity '{entity}' not found"}
@@ -284,12 +323,12 @@ def search_graph(entity: str, relationship_type: Optional[str] = None) -> dict:
     }
 
 
-def search_graph_neighborhood(entity: str, depth: int = 1) -> dict:
+def search_graph_neighborhood(entity: str, depth: int = 1, subject: str = "default") -> dict:
     """Get entity neighborhood from the knowledge graph.
 
     Returns entities and relationships within the specified depth.
     """
-    graph = KnowledgeGraph()
+    graph = KnowledgeGraph(subject=subject)
     entity_obj = graph.search_entity(entity)
     if not entity_obj:
         return {"error": f"Entity '{entity}' not found"}
@@ -301,15 +340,15 @@ def search_graph_neighborhood(entity: str, depth: int = 1) -> dict:
     }
 
 
-def get_book_toc(title: str) -> dict:
+def get_book_toc(title: str, subject: str = "default") -> dict:
     """Get book table of contents / structure.
 
     Searches for distinct chapter/section combinations from chunks belonging
     to the given book title.
     """
     settings = get_settings()
-    db = VectorDatabase(settings)
-    embedder = EmbeddingEngine(settings)
+    embedder = create_embedder(settings)
+    db = VectorDatabase(settings, subject=subject, vector_dim=embedder.dimension)
 
     # Search for the book by title using a simple embedding query
     query_embedding = embedder.embed_query(title)
@@ -341,19 +380,20 @@ def get_book_toc(title: str) -> dict:
     }
 
 
-def get_section(book_title: str, section_path: str) -> list[dict]:
+def get_section(book_title: str, section_path: str, subject: str = "default") -> list[dict]:
     """Retrieve specific section from a book.
 
     Args:
         book_title: Title of the book.
         section_path: Chapter or section name to retrieve.
+        subject: Subject domain to search in.
 
     Returns:
         List of chunk dicts ordered by page number.
     """
     settings = get_settings()
-    db = VectorDatabase(settings)
-    embedder = EmbeddingEngine(settings)
+    embedder = create_embedder(settings)
+    db = VectorDatabase(settings, subject=subject, vector_dim=embedder.dimension)
 
     # Use section_path as search query for semantic matching
     query_embedding = embedder.embed_query(f"{book_title} {section_path}")
@@ -407,8 +447,10 @@ def search_by_metadata(
             continue
         if topic and topic.lower() not in getattr(book, "title", "").lower():
             # Also check tags/subject if available
-            tags = getattr(book, "tags", []) or []
-            if not any(topic.lower() in t.lower() for t in tags):
+            tags_str = getattr(book, "tags", "") or ""
+            subject_str = getattr(book, "subject", "") or ""
+            searchable = f"{tags_str},{subject_str}".lower()
+            if topic.lower() not in searchable:
                 continue
         matching_books.append(book)
 
@@ -439,7 +481,7 @@ def list_all_books() -> list[dict]:
     ]
 
 
-def graph_stats() -> dict:
+def graph_stats(subject: str = "default") -> dict:
     """Return knowledge graph statistics."""
-    graph = KnowledgeGraph()
+    graph = KnowledgeGraph(subject=subject)
     return graph.get_stats()

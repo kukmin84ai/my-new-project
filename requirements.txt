@@ -29,9 +29,13 @@ python-dotenv>=1.0
 # LLM (local)
 ollama>=0.3
 
+# HTTP (used by API embedding providers)
+requests>=2.31
+
 # Testing
 pytest>=8.0
 pytest-asyncio>=0.23
+faker>=22.0
 
 # MCP Server
 mcp[cli]>=1.0

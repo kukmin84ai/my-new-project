@@ -61,10 +61,15 @@ class KnowledgeGraph:
     for larger datasets.
     """
 
-    def __init__(self, store_dir: Optional[Path] = None):
+    def __init__(self, store_dir: Optional[Path] = None, subject: str = "default"):
         settings = get_settings()
-        self.store_dir = store_dir or settings.graph_store_dir
-        self.store_dir = Path(self.store_dir)
+        base_dir = Path(store_dir) if store_dir else settings.graph_store_dir
+        base_dir = Path(base_dir)
+
+        # Migrate: move legacy root-level files to default/ subdirectory
+        self._migrate_legacy(base_dir)
+
+        self.store_dir = base_dir / subject
         self.store_dir.mkdir(parents=True, exist_ok=True)
 
         self.entities_file = self.store_dir / "entities.json"
@@ -73,6 +78,21 @@ class KnowledgeGraph:
         self.entities: dict[str, Entity] = {}
         self.relationships: list[Relationship] = []
         self._load()
+
+    @staticmethod
+    def _migrate_legacy(base_dir: Path) -> None:
+        """Move legacy root-level graph files into default/ subdirectory."""
+        legacy_entities = base_dir / "entities.json"
+        legacy_rels = base_dir / "relationships.json"
+        if legacy_entities.exists() or legacy_rels.exists():
+            default_dir = base_dir / "default"
+            default_dir.mkdir(parents=True, exist_ok=True)
+            if legacy_entities.exists() and not (default_dir / "entities.json").exists():
+                legacy_entities.rename(default_dir / "entities.json")
+                logger.info("Migrated legacy entities.json to default/")
+            if legacy_rels.exists() and not (default_dir / "relationships.json").exists():
+                legacy_rels.rename(default_dir / "relationships.json")
+                logger.info("Migrated legacy relationships.json to default/")
 
     def _load(self) -> None:
         """Load graph from disk."""

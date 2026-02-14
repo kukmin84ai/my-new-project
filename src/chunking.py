@@ -91,8 +91,9 @@ class ChunkingEngine:
                 section=section,
             )
 
-            # Generate context prefixes
+            # Propagate document-level metadata and generate context prefixes
             for chunk in pc_chunks:
+                chunk.metadata = dict(metadata)
                 chunk.context_prefix = self._generate_context_prefix(
                     chunk, metadata
                 )

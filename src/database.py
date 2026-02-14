@@ -1,7 +1,6 @@
-"""LanceDB vector database and BGE-M3 embedding for Bibliotheca AI.
+"""LanceDB vector database for Bibliotheca AI.
 
 Provides:
-- EmbeddingEngine: BGE-M3 embedding with auto GPU detection and batching
 - VectorDatabase: LanceDB-based vector store with hybrid search support
 """
 
@@ -11,94 +10,98 @@ from typing import Optional
 
 import lancedb
 import pyarrow as pa
-from sentence_transformers import SentenceTransformer
 
-from src.config import Settings, get_settings, detect_device
+from src.config import Settings, get_settings
 
 logger = logging.getLogger("bibliotheca.database")
 
 
-class EmbeddingEngine:
-    """BGE-M3 embedding with auto GPU detection."""
-
-    def __init__(self, settings: Optional[Settings] = None):
-        self.settings = settings or get_settings()
-        self.device = detect_device(self.settings.gpu_device)
-        logger.info(
-            "Loading embedding model %s on %s",
-            self.settings.embedding_model,
-            self.device,
-        )
-        self.model = SentenceTransformer(
-            self.settings.embedding_model, device=self.device
-        )
-        self.batch_size = self.settings.embedding_batch_size
-
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        """Embed a batch of texts, returning list of vectors."""
-        embeddings = self.model.encode(
-            texts,
-            batch_size=self.batch_size,
-            show_progress_bar=len(texts) > self.batch_size,
-            normalize_embeddings=True,
-        )
-        return embeddings.tolist()
-
-    def embed_query(self, query: str) -> list[float]:
-        """Embed a single query string."""
-        embedding = self.model.encode(
-            query, normalize_embeddings=True
-        )
-        return embedding.tolist()
-
-    @property
-    def dimension(self) -> int:
-        """Return the embedding dimension."""
-        return self.model.get_sentence_embedding_dimension()
+# Default vector dimension (BGE-M3 / Voyage / Jina = 1024)
+DEFAULT_VECTOR_DIM = 1024
 
 
-# LanceDB document schema
-DOCUMENT_SCHEMA = pa.schema(
-    [
-        pa.field("id", pa.string()),
-        pa.field("text", pa.string()),
-        pa.field("vector", pa.list_(pa.float32(), 1024)),
-        pa.field("parent_id", pa.string()),
-        pa.field("source_file", pa.string()),
-        pa.field("page_num", pa.int32()),
-        pa.field("chapter", pa.string()),
-        pa.field("section", pa.string()),
-        pa.field("language", pa.string()),
-        pa.field("ocr_confidence", pa.float32()),
-        pa.field("book_title", pa.string()),
-        pa.field("author", pa.string()),
-        pa.field("is_parent", pa.bool_()),
-        pa.field("context_prefix", pa.string()),
-    ]
-)
+def get_document_schema(vector_dim: int = DEFAULT_VECTOR_DIM) -> pa.Schema:
+    """Build LanceDB document schema with configurable vector dimension.
+
+    Different embedding providers produce different dimensions:
+    - BGE-M3 (local): 1024
+    - Voyage-3: 1024
+    - Jina-v3: 1024
+    - OpenAI text-embedding-3-small: 1536
+    - OpenAI text-embedding-3-large: 3072
+    """
+    return pa.schema(
+        [
+            pa.field("id", pa.string()),
+            pa.field("text", pa.string()),
+            pa.field("vector", pa.list_(pa.float32(), vector_dim)),
+            pa.field("parent_id", pa.string()),
+            pa.field("source_file", pa.string()),
+            pa.field("page_num", pa.int32()),
+            pa.field("chapter", pa.string()),
+            pa.field("section", pa.string()),
+            pa.field("language", pa.string()),
+            pa.field("ocr_confidence", pa.float32()),
+            pa.field("book_title", pa.string()),
+            pa.field("author", pa.string()),
+            pa.field("is_parent", pa.bool_()),
+            pa.field("context_prefix", pa.string()),
+            pa.field("subject", pa.string()),
+            pa.field("embedding_model", pa.string()),
+        ]
+    )
+
+
+# Default schema for backwards compatibility
+DOCUMENT_SCHEMA = get_document_schema()
 
 
 class VectorDatabase:
     """LanceDB-based vector store with hybrid search."""
 
-    def __init__(self, settings: Optional[Settings] = None):
+    def __init__(
+        self,
+        settings: Optional[Settings] = None,
+        subject: str = "default",
+        vector_dim: int = DEFAULT_VECTOR_DIM,
+    ):
         self.settings = settings or get_settings()
+        self.subject = self._validate_subject(subject)
+        self.vector_dim = vector_dim
         self.db_path = str(self.settings.lancedb_dir)
         Path(self.db_path).mkdir(parents=True, exist_ok=True)
         self.db = lancedb.connect(self.db_path)
         self._table = None
-        logger.info("VectorDatabase connected at %s", self.db_path)
+        logger.info("VectorDatabase connected at %s (subject=%s)", self.db_path, self.subject)
 
-    def create_table(self, name: str = "documents") -> None:
+    @staticmethod
+    def _validate_subject(subject: str) -> str:
+        """Validate subject name is a safe identifier for table naming."""
+        import re
+        if not re.match(r'^[a-zA-Z0-9_-]+$', subject):
+            raise ValueError(
+                f"Invalid subject name '{subject}': "
+                "must contain only letters, digits, underscores, and hyphens"
+            )
+        return subject
+
+    def _get_table_name(self) -> str:
+        """Return table name for the current subject."""
+        if self.subject == "default":
+            return "documents"
+        return f"{self.subject}_documents"
+
+    def create_table(self, name: str = None) -> None:
         """Create the documents table if it doesn't exist."""
+        name = name or self._get_table_name()
         existing = self.db.table_names()
         if name in existing:
             self._table = self.db.open_table(name)
             logger.info("Opened existing table: %s", name)
         else:
-            # Create with empty data matching schema
-            self._table = self.db.create_table(name, schema=DOCUMENT_SCHEMA)
-            logger.info("Created new table: %s", name)
+            schema = get_document_schema(self.vector_dim)
+            self._table = self.db.create_table(name, schema=schema)
+            logger.info("Created new table: %s (vector_dim=%d)", name, self.vector_dim)
 
     def _ensure_table(self) -> None:
         """Ensure table is initialized."""
@@ -131,6 +134,8 @@ class VectorDatabase:
                 "author": doc.get("author", ""),
                 "is_parent": doc.get("is_parent", False),
                 "context_prefix": doc.get("context_prefix", ""),
+                "subject": doc.get("subject", ""),
+                "embedding_model": doc.get("embedding_model", ""),
             }
             rows.append(row)
 
@@ -191,7 +196,8 @@ class VectorDatabase:
             logger.debug("FTS index already exists or creation failed")
 
         search_query = (
-            self._table.search(query_embedding, query_type="hybrid")
+            self._table.search(query_type="hybrid")
+            .vector(query_embedding)
             .text(query)
             .limit(top_k)
         )
@@ -230,3 +236,31 @@ class VectorDatabase:
         """Return total number of documents in the table."""
         self._ensure_table()
         return self._table.count_rows()
+
+    def create_index(self) -> None:
+        """Create ANN index for large-scale search (100k+ chunks)."""
+        self._ensure_table()
+        try:
+            self._table.create_index(
+                metric="cosine",
+                num_partitions=256,
+                num_sub_vectors=96,
+                index_type="IVF_PQ",
+            )
+            logger.info("Created ANN index on table %s", self._get_table_name())
+        except Exception:
+            logger.warning("ANN index creation failed (may already exist)", exc_info=True)
+
+    @classmethod
+    def list_subject_tables(cls, settings: Optional[Settings] = None) -> list[str]:
+        """List all subject-based document tables in the database."""
+        settings = settings or get_settings()
+        db = lancedb.connect(str(settings.lancedb_dir))
+        tables = db.table_names()
+        subjects = []
+        for t in tables:
+            if t == "documents":
+                subjects.append("default")
+            elif t.endswith("_documents"):
+                subjects.append(t.removesuffix("_documents"))
+        return subjects
