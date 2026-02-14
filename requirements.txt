@@ -1,0 +1,37 @@
+# Core Framework
+pydantic>=2.0,<3.0
+pydantic-settings>=2.0,<3.0
+
+# OCR - Tier 1: Marker (Surya-based, local)
+marker-pdf>=1.0
+
+# OCR - Tier 2: Docling (IBM, local)
+docling>=2.0
+
+# OCR - Tier 3: LlamaParse (cloud fallback, optional)
+llama-parse>=0.5
+
+# Embedding
+sentence-transformers>=3.0
+torch>=2.0
+
+# Vector Database
+lancedb>=0.9
+pyarrow>=14.0
+
+# NLP Utilities
+langdetect>=1.0
+ebooklib>=0.18
+
+# Metadata & Storage
+python-dotenv>=1.0
+
+# LLM (local)
+ollama>=0.3
+
+# Testing
+pytest>=8.0
+pytest-asyncio>=0.23
+
+# Utilities
+tqdm>=4.66

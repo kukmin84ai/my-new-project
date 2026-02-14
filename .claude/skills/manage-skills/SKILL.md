@@ -28,13 +28,15 @@ Detects and corrects drift in verification skills by analyzing changes in the cu
 
 List of verification skills currently registered in the project. Update this list when creating/deleting new skills.
 
-(No verification skills registered yet)
-
-<!-- When skills are added, register in the following format:
 | Skill | Description | Coverage File Patterns |
 |-------|-------------|------------------------|
-| `verify-example` | Example verification | `src/example/**/*.ts` |
--->
+| `verify-syntax` | Verifies Python syntax and required files | `src/*.py`, `requirements.txt` |
+| `verify-config` | Verifies Pydantic BaseSettings configuration | `src/config.py`, `.env.example` |
+| `verify-ocr-quality` | Verifies 3-tier OCR pipeline | `src/processors.py` |
+| `verify-embedding-coverage` | Verifies BGE-M3 + LanceDB setup | `src/database.py` |
+| `verify-retrieval-accuracy` | Verifies query engine and RAG tools | `src/agent_tools.py` |
+| `verify-gpu-acceleration` | Verifies GPU auto-detection | `src/config.py`, `src/database.py`, `src/processors.py` |
+| `verify-incremental-ingest` | Verifies incremental processing | `src/metadata.py`, `src/ingest.py` |
 
 ## Workflow
 

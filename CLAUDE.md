@@ -10,6 +10,13 @@ Custom verification and maintenance skills are defined in `.claude/skills/`.
 |-------|---------|
 | `verify-implementation` | Sequentially executes all verify skills in the project to generate an integrated verification report |
 | `manage-skills` | Analyzes session changes, creates/updates verification skills, and manages CLAUDE.md |
+| `verify-syntax` | Verifies all Python source files parse correctly and required project files exist |
+| `verify-config` | Verifies configuration module uses Pydantic BaseSettings with no hardcoded values |
+| `verify-ocr-quality` | Verifies 3-tier OCR pipeline structure with language auto-detection and multi-format support |
+| `verify-embedding-coverage` | Verifies BGE-M3 embedding with LanceDB vector store and no legacy dependencies |
+| `verify-retrieval-accuracy` | Verifies query engine structure with agentic RAG tools and source attribution |
+| `verify-gpu-acceleration` | Verifies GPU auto-detection and device-aware processing across all modules |
+| `verify-incremental-ingest` | Verifies incremental processing with file hash dedup and force-reprocess support |
 
 ## Agent Teams
 

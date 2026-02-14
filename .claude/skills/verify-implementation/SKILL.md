@@ -27,13 +27,15 @@ Performs integrated verification by sequentially executing all `verify-*` skills
 
 List of verification skills to be executed sequentially by this skill. `/manage-skills` automatically updates this list when creating/deleting skills.
 
-(No verification skills registered yet)
-
-<!-- When skills are added, register in the following format:
 | # | Skill | Description |
 |---|-------|-------------|
-| 1 | `verify-example` | Example verification description |
--->
+| 1 | `verify-syntax` | Verifies all Python source files parse correctly and required project files exist |
+| 2 | `verify-config` | Verifies configuration module uses Pydantic BaseSettings with no hardcoded values |
+| 3 | `verify-ocr-quality` | Verifies 3-tier OCR pipeline structure with language auto-detection and multi-format support |
+| 4 | `verify-embedding-coverage` | Verifies BGE-M3 embedding with LanceDB vector store and no legacy dependencies |
+| 5 | `verify-retrieval-accuracy` | Verifies query engine structure with agentic RAG tools and source attribution |
+| 6 | `verify-gpu-acceleration` | Verifies GPU auto-detection and device-aware processing across all modules |
+| 7 | `verify-incremental-ingest` | Verifies incremental processing with file hash dedup and force-reprocess support |
 
 ## Workflow
 
